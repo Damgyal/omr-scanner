@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>MCQ OMR Mobile Scanner</title>
+<style>
+  :root{--blue:#1f6feb;--muted:#f4f7fb;--card:#ffffff}
+  body{font-family:system-ui, -apple-system, Roboto, Arial; margin:0; background:var(--muted); color:#0f172a}
+  header{background:var(--blue); color:#fff; padding:12px 16px; display:flex; align-items:center; justify-content:space-between}
+  header h1{margin:0; font-size:1.1rem}
+  .container{max-width:980px;margin:14px auto;padding:14px;background:var(--card);border-radius:12px;box-shadow:0 8px 24px rgba(2,6,23,0.06)}
+  .camera-wrap{display:flex;gap:12px;flex-wrap:wrap}
+  .video-box{flex:1 1 420px; min-width:300px; background:#000; border-radius:10px; overflow:hidden; position:relative}
+  video#video{width:100%; height:100%; object-fit:cover; display:block}
+  .controls{flex:0 0 280px; min-width:240px}
+  label{font-weight:600; display:block; margin-top:12px}
+  input, select, button{width:100%; padding:8px; margin-top:6px; border-radius:8px; border:1px solid #cbd5e1; box-sizing:border-box; font-size:14px}
+  button.primary{background:var(--blue); color:#fff; border:none; cursor:pointer; font-weight:700}
+  button.ghost{background:#f8fafc; color:#0f172a}
+  .status{font-size:13px; margin-top:8px}
+  canvas{display:block; width:100%; border-radius:10px; margin-top:8px; max-height:420px; border:1px solid #e6eefc}
+  table{width:100%; border-collapse:collapse; margin-top:12px}
+  th,td{border:1px solid #e6eefc; padding:8px; text-align:center}
+  .score{font-weight:800; color:var(--blue); margin-top:12px}
+  .upload-hint{font-size:13px; color:#374151; margin-top:6px}
+  .small{font-size:13px; color:#6b7280}
+  .row-flex{display:flex; gap:8px; margin-top:6px}
+  .dropdown-short{width:70px}
+  @media (max-width:700px){ .camera-wrap{flex-direction:column} .controls{order:2} .video-box{order:1} }
+</style>
+</head>
+<body>
+<header>
+  <h1>MCQ OMR Mobile Scanner</h1>
+  <div style="opacity:.9; font-size:.9rem">Manual capture • Mobile-ready</div>
+</header>
+
+<div class="container">
+  <div class="camera-wrap">
+    <div class="video-box" id="videoContainer">
+      <video id="video" autoplay playsinline></video>
+      <canvas id="captureCanvas" style="display:none"></canvas>
+    </div>
+
+    <div class="controls">
+      <label>Student Name</label>
+      <input id="studentName" placeholder="Enter student name">
+
+      <label>Class</label>
+      <input id="studentClass" placeholder="e.g., X">
+
+      <label>Section</label>
+      <input id="studentSection" placeholder="e.g., A">
+
+      <label>Number of Questions</label>
+      <input id="numQuestions" type="number" min="1" max="200" value="10">
+
+      <div class="row-flex">
+        <button id="generateBtn" class="ghost">Generate Answer Key</button>
+        <button id="captureBtn" class="primary">📸 Capture OMR Sheet</button>
+      </div>
+
+      <div class="status" id="status">OpenCV: <span id="cvStatus">Loading...</span></div>
+      <div class="upload-hint small">Tip: align the sheet in the preview and tap Capture when steady.</div>
+    </div>
+  </div>
+
+  <div id="answerKeyArea" style="margin-top:12px"></div>
+
+  <canvas id="omrCanvas"></canvas>
+
+  <div id="results"></div>
+  <div style="margin-top:10px">
+    <button id="downloadBtn" style="display:none" class="primary">Download Results (CSV)</button>
+  </div>
+</div>
+
+<!-- OpenCV.js (use official CDN) -->
+<script async src="https://docs.opencv.org/4.x/opencv.js" type="text/javascript"></script>
+
+<script>
+/* -----------------------------
+   App state & DOM refs
+   -----------------------------*/
+const video = document.getElementById('video');
+const captureBtn = document.getElementById('captureBtn');
+const generateBtn = document.getElementById('generateBtn');
+const answerKeyArea = document.getElementById('answerKeyArea');
+const numQuestionsInput = document.getElementById('numQuestions');
+const captureCanvas = document.getElementById('captureCanvas');
+const omrCanvas = document.getElementById('omrCanvas');
+const resultsDiv = document.getElementById('results');
+const downloadBtn = document.getElementById('downloadBtn');
+const cvStatus = document.getElementById('cvStatus');
+
+let stream = null;
+let correctAnswers = [];
+let lastSnapshot = null;
+let cvReady = false;
+
+/* -----------------------------
+   Initialize camera (rear)
+   -----------------------------*/
+async function startCamera(){
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { exact: "environment" } }, // try exact rear camera first
+      audio: false
+    });
+  } catch(e) {
+    // fallback to any camera if exact not available
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false
+    });
+  }
+  video.srcObject = stream;
+}
+startCamera().catch(err => {
+  alert('Camera access is required. Error: ' + err.message);
+});
+
+/* -----------------------------
+   Wait for OpenCV runtime
+   -----------------------------*/
+function onCvReady() {
+  cvStatus.textContent = 'Ready';
+  cvReady = true;
+}
+if (typeof cv !== 'undefined') {
+  if (cv.getBuildInformation) {
+    onCvReady();
+  } else {
+    // wait for runtime
+    cv['onRuntimeInitialized'] = onCvReady;
+  }
+} else {
+  // cv script not yet loaded; set fallback when it does
+  window.addEventListener('opencvready', onCvReady);
+}
+
+/* -----------------------------
+   Answer key generation (dropdowns A-D)
+   -----------------------------*/
+generateBtn.addEventListener('click', () => {
+  const n = parseInt(numQuestionsInput.value) || 0;
+  if (n < 1) return alert('Enter number of questions.');
+  correctAnswers = new Array(n).fill('');
+  answerKeyArea.innerHTML = '';
+
+  const grid = document.createElement('div');
+  grid.style.display = 'grid';
+  grid.style.gridTemplateColumns = 'repeat(auto-fit, minmax(120px, 1fr))';
+  grid.style.gap = '8px';
+
+  for (let i=0;i<n;i++){
+    const wrap = document.createElement('div');
+    wrap.style.padding = '8px';
+    wrap.style.border = '1px solid #eef2ff';
+    wrap.style.borderRadius = '8px';
+    wrap.innerHTML = `
+      <div style="font-weight:700;margin-bottom:4px">Q${i+1}</div>
+      <select data-q="${i}" class="answer-select">
+        <option value="">—</option>
+        <option value="A">A</option>
+        <option value="B">B</option>
+        <option value="C">C</option>
+        <option value="D">D</option>
+      </select>
+    `;
+    grid.appendChild(wrap);
+  }
+  answerKeyArea.appendChild(grid);
+});
+
+/* -----------------------------
+   Capture snapshot handler
+   -----------------------------*/
+captureBtn.addEventListener('click', async () => {
+  if (!cvReady) return alert('OpenCV is still loading. Wait a moment and try again.');
+
+  // draw current video frame to captureCanvas at video resolution
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return alert('Video not ready. Try again in a moment.');
+
+  captureCanvas.width = vw;
+  captureCanvas.height = vh;
+  const ctx = captureCanvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, vw, vh);
+  lastSnapshot = ctx.getImageData(0,0,vw,vh);
+
+  // show snapshot to user in omrCanvas scaled to fit container
+  const maxW = Math.min(900, vw);
+  const scale = maxW / vw;
+  omrCanvas.width = vw * scale;
+  omrCanvas.height = vh * scale;
+  const octx = omrCanvas.getContext('2d');
+  // draw scaled
+  octx.drawImage(captureCanvas, 0, 0, omrCanvas.width, omrCanvas.height);
+
+  // now run OMR detection
+  runScanAndReport();
+});
+
+/* -----------------------------
+   Core OMR detection using OpenCV
+   Improved logic:
+   - Finds circular-ish contours by aspect ratio & area
+   - Groups by Y coordinate (rows)
+   - For each bubble, compute fill ratio on original grayscale image (not threshold-only)
+   - Decision rule:
+       - candidate if fill > 0.18 AND fill >= secondBest * 1.4
+       - if multiple candidates close in fill => "Multiple"
+       - if none meet threshold => "No mark"
+   -----------------------------*/
+function detectOMRAnswersFromCanvas(canvas, numQuestions) {
+  // We'll read scaled canvas, but process on a grayscale resized image for performance
+  const src = cv.imread(canvas);
+  const proc = new cv.Mat();
+  cv.cvtColor(src, proc, cv.COLOR_RGBA2GRAY);
+
+  // gentle blur to reduce noise
+  cv.GaussianBlur(proc, proc, new cv.Size(5,5), 0);
+
+  // adaptive threshold for bubble detection (invert so bubbles are white)
+  const thresh = new cv.Mat();
+  cv.adaptiveThreshold(proc, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 25, 9);
+
+  // find contours
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  const bubbles = [];
+  for (let i=0;i<contours.size();i++){
+    const cnt = contours.get(i);
+    const rect = cv.boundingRect(cnt);
+    const aspect = rect.width / rect.height;
+    const area = rect.width * rect.height;
+
+    // filter reasonable bubble sizes based on canvas size
+    // adapt area thresholds relative to image area for resilience
+    const imgArea = src.cols * src.rows;
+    const minArea = Math.max(80, imgArea * 0.00008);
+    const maxArea = Math.min(20000, imgArea * 0.004);
+
+    // prefer near-square shapes (bubbles)
+    if (aspect > 0.6 && aspect < 1.5 && area > minArea && area < maxArea) {
+      bubbles.push({ x: rect.x + rect.width/2, y: rect.y + rect.height/2, rect });
+    }
+    cnt.delete();
+  }
+
+  // group by rows using y clustering
+  bubbles.sort((a,b) => a.y - b.y);
+  const grouped = [];
+  const yGap = Math.max(8, Math.round(src.rows * 0.02)); // adapt row threshold
+  for (const b of bubbles){
+    let placed = false;
+    for (const g of grouped){
+      if (Math.abs(g[0].y - b.y) < yGap) { g.push(b); placed = true; break; }
+    }
+    if (!placed) grouped.push([b]);
+  }
+
+  // sort each row by x ascending
+  grouped.forEach(r => r.sort((a,b) => a.x - b.x));
+
+  // limit to requested number of questions from top rows
+  const rows = Math.min(numQuestions, grouped.length);
+  const answers = [];
+
+  for (let i=0;i<rows;i++){
+    const row = grouped[i];
+    const fills = [];
+    for (let j=0;j<row.length;j++){
+      const r = row[j].rect;
+      // ROI from the grayscale image (proc)
+      const roi = proc.roi(r);
+      const nonZero = cv.countNonZero(roi);
+      const total = r.width * r.height;
+      const fillRatio = nonZero / total; // higher means more ink (since we inverted earlier)
+      roi.delete();
+      fills.push({ idx: j, fill: fillRatio });
+    }
+
+    // if no bubbles detected in row
+    if (fills.length === 0) { answers.push('None'); continue; }
+
+    // find best and second best
+    fills.sort((a,b) => b.fill - a.fill);
+    const best = fills[0];
+    const second = fills[1] || { fill: 0 };
+
+    // thresholds tuned for robustness
+    const absoluteThreshold = 0.18;        // require at least this fill ratio
+    const relativeFactor = 1.4;            // best must be relativeFactor * second
+
+    // check for multiple high fills (close in value)
+    const multipleClose = fills.filter(f => f.fill > Math.max(absoluteThreshold, best.fill * 0.7)).length > 1;
+
+    if (best.fill < absoluteThreshold) {
+      answers.push('None'); // too light
+    } else if (multipleClose && (best.fill - second.fill) < 0.06) {
+      answers.push('Multiple'); // ambiguous / double
+    } else if (best.fill >= (second.fill * relativeFactor) || second.fill === 0) {
+      // determine letter by position among bubbles left-to-right
+      // map index (in sorted-left-right order) to A-D
+      // but we must use the row sorted left-to-right; previously we computed fills based on that
+      // it's possible the number of options per row isn't exactly 4; handle gracefully
+      const idx = best.idx; // this is index within row left-to-right
+      const letter = ['A','B','C','D','E'][idx] || '?';
+      answers.push(letter);
+    } else {
+      answers.push('Multiple');
+    }
+  }
+
+  // cleanup
+  src.delete(); proc.delete(); thresh.delete(); contours.delete(); hierarchy.delete();
+  return answers;
+}
+
+/* -----------------------------
+   Run scanning, compare with key, show report + CSV
+   -----------------------------*/
+function runScanAndReport(){
+  // read correct answers from UI
+  const selects = document.querySelectorAll('.answer-select');
+  const n = selects.length;
+  if (n === 0) return alert('Generate an answer key first.');
+
+  const key = [];
+  for (let i=0;i<n;i++){
+    const v = selects[i].value;
+    if (!v) return alert('Please fill all answer key dropdowns (use — for blank if needed).');
+    if (!['A','B','C','D','E'].includes(v)) return alert('Valid answers A-D (or E) only.');
+    key.push(v);
+  }
+
+  const studentName = document.getElementById('studentName').value.trim();
+  const studentClass = document.getElementById('studentClass').value.trim();
+  const studentSection = document.getElementById('studentSection').value.trim();
+  if (!studentName || !studentClass || !studentSection) return alert('Please enter student info.');
+
+  // process on the displayed omrCanvas (which may be scaled)
+  const detected = detectOMRAnswersFromCanvas(omrCanvas, n);
+
+  // scoring and building table
+  let correctCount = 0;
+  const rowsHtml = [];
+  for (let i=0;i<n;i++){
+    const stud = detected[i] || 'None';
+    const correct = key[i] || '';
+    let status = '❌';
+    if (stud === correct) { status = '✅'; correctCount++; }
+    // display mapping for None/Multiple
+    let disp = stud;
+    if (stud === 'None') disp = 'No mark';
+    if (stud === 'Multiple') disp = 'Double mark';
+    rowsHtml.push(`<tr><td>${i+1}</td><td>${disp}</td><td>${correct}</td><td>${status}</td></tr>`);
+  }
+
+  resultsDiv.innerHTML = `
+    <h3>Results — ${escapeHtml(studentName)}</h3>
+    <table>
+      <thead><tr><th>Q#</th><th>Student</th><th>Correct</th><th>Status</th></tr></thead>
+      <tbody>${rowsHtml.join('')}</tbody>
+    </table>
+    <div class="score">Total Score: ${correctCount} / ${n}</div>
+  `;
+
+  // generate CSV
+  downloadBtn.style.display = 'inline-block';
+  const csvRows = [];
+  csvRows.push(['Name','Class','Section','Total','OutOf']);
+  csvRows.push([studentName, studentClass, studentSection, correctCount, n]);
+  csvRows.push([]);
+  csvRows.push(['Q#','StudentAnswer','CorrectAnswer','Status']);
+  for (let i=0;i<n;i++){
+    const stud = detected[i] || 'None';
+    const status = (stud === key[i]) ? 'Correct' : 'Wrong';
+    csvRows.push([i+1, stud, key[i], status]);
+  }
+  const csvContent = csvRows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+
+  downloadBtn.onclick = () => {
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${studentName}_omr_result.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+}
+
+/* -----------------------------
+   small utility
+   -----------------------------*/
+function escapeHtml(s){
+  return s.replace && s.replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"})[m]; });
+}
+</script>
+</body>
+</html>
